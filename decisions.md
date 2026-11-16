@@ -1,4 +1,4 @@
-# Architectural Decisions & Benchmark History
+# Trimodal Adaptive RAG — Architectural Decisions & Benchmark History
 
 > **Note:** This document captures key architectural decisions across all iterations and archives earlier experimental phases—including baseline benchmarks run on models since deprecated by OpenAI.
 

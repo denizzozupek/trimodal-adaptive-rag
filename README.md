@@ -1,4 +1,4 @@
-# Multi-Document Conversational RAG Assistant
+# Trimodal Adaptive RAG
 
 A production-oriented **Tri-Modal Agentic & Corrective RAG** platform built with **LangGraph**, **ChromaDB**, **BM25s**, **Cross-Encoder Reranking**, and **SQLite Checkpointing**. Designed for high-precision multi-document QA with configurable execution modes (**CRAG**, **Agentic ReAct**, and **Adaptive Escalate**) and systematically benchmarked on a 60-question evaluation suite.
 
@@ -99,7 +99,7 @@ flowchart TD
 ## 5. Project Structure
 
 ```text
-multidoc_rag_assistant/
+trimodal-adaptive-rag/
 ├── app_gui.py                         # Streamlit UI (3 modes + AsyncFriendlySqliteSaver)
 ├── decisions.md                       # Architectural decisions & full benchmark history
 ├── requirements.txt                   # Pinned dependencies
@@ -156,8 +156,8 @@ multidoc_rag_assistant/
 ### Installation
 ```bash
 # 1. Clone the repository
-git clone https://github.com/denizzozupek/multi-doc-rag-assistant.git
-cd multi-doc-rag-assistant
+git clone https://github.com/denizzozupek/trimodal-adaptive-rag.git
+cd trimodal-adaptive-rag
 
 # 2. Create and activate a virtual environment
 python -m venv .venv

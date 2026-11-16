@@ -206,9 +206,9 @@ def process_uploaded_file(uploaded_file):
 
 
 # --- Application Setup & Session Initialization ---
-st.set_page_config(page_title="Document Assistant", layout="wide")
-st.title("Conversational Document Assistant")
-st.caption("Conversational RAG with LangGraph")
+st.set_page_config(page_title="Trimodal Adaptive RAG", layout="wide")
+st.title("Trimodal Adaptive RAG")
+st.caption("CRAG • ReAct Agent • Adaptive Escalate")
 
 start_chat_session()
 
