@@ -36,6 +36,16 @@ CONTEXTUAL_LLM = ChatOpenAI(
     max_retries=6,
 )
 
+# Separate model family from DEFAULT_LLM to avoid same-model judge bias
+JUDGE_LLM = ChatOpenAI(
+    model="gpt-4.1",
+    temperature=0,
+    timeout=30,
+    max_retries=3,
+)
+
+DEFAULT_RECURSION_LIMIT = 20
+
 EMBEDDING_MODEL_NAME = "text-embedding-3-small"
 CROSS_ENCODER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 

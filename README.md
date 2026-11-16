@@ -72,25 +72,27 @@ flowchart TD
 ## 4. Evaluation & Benchmark Results
 
 ### Methodology
-* **Dataset:** 60 structured test queries across 3 academic papers (`arxiv1.pdf`, `arxiv2.pdf`, `arxiv3.pdf`) — comprising 50 document-grounded questions, 10 out-of-scope questions, and 20 multi-turn conversational follow-ups.
-* **LLM-as-a-Judge:** Automated Pydantic-enforced scoring on a 1–5 scale for **Faithfulness** (zero hallucination) and **Relevance** (intent alignment).
-* **Execution:** Async concurrent evaluation (`asyncio.Semaphore`) with recursion protection (`recursion_limit=10`) and component-level latency/token telemetry.
+* **Dataset:** 60 test queries across 3 papers (`arxiv1.pdf`, `arxiv2.pdf`, `arxiv3.pdf`) — 50 document questions, 10 out-of-scope questions, and 20 multi-turn follow-ups.
+* **Independent Judge:** Scored on a 1–5 scale using **`gpt-5.4-mini`** (`temperature=0.0`) as an independent judge separate from the **`gpt-6-luna`** generator (`temperature=0.0`, `reasoning_effort="none"`).
+* **Execution:** Async evaluation (`asyncio.Semaphore`) with `recursion_limit=20` (0% error rate across all 60 queries), tracking tool calls, escalation rate, latency, and tokens.
 
-### Current Production Benchmarks (`gpt-6-luna`, `temperature=0.0`, `reasoning_effort="none"`)
+### Current Production Benchmarks (`gpt-6-luna` Generator · `gpt-5.4-mini` Judge · 60/60 Valid)
 
-| Architecture / Mode | Faithfulness (0-5) | Relevance (0-5) | Multi-Turn Score | Avg Gen Latency | P95 Gen Latency | Avg Tokens / Query | Avg Cost / Query | Total Cost (60 Queries) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **CRAG (Single-Pass)** | 4.72 | 4.93 | **4.95** | **6.94 s** | **10.53 s** | 2,369 | **$0.00027** | **$0.0164** |
-| **Adaptive Escalate (Hybrid)** | **4.81** *(+0.09)* | 4.95 | **4.95** | **7.23 s** | 15.50 s | 2,904 | **$0.00034** | **$0.0205** |
-| **Pure ReAct Agent (Multi-Hop)** | **4.90** | **4.98** | 4.85 | 9.98 s | 35.21 s | 3,472 | **$0.00046** | **$0.0279** |
+| Architecture / Mode | Faithfulness (0-5) | Relevance (0-5) | Multi-Turn (F / R) | Avg Gen Latency | P95 Gen Latency | Avg RAG Tokens / Query | Est. RAG Cost / Query | Tool Calls / Escalation |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **CRAG (Single-Pass)** | **4.82** | 4.83 | **5.00 / 5.00** | **9.42 s** | **14.18 s** | **2,367** | **~$0.00029** | 0.00 tools · 21.7% web (`13/60`) |
+| **Pure ReAct Agent (Multi-Hop)** | 4.72 | 4.97 | 4.85 / 5.00 | 10.65 s | 35.29 s | 3,628 | ~$0.00043 | 1.38 tools (`82` docs, `1` web) |
+| **Adaptive Escalate (Sufficiency-Aware)** | **4.82** | **4.98** | **5.00 / 5.00** | 12.94 s | 27.53 s | 4,432 | ~$0.00051 | 0.73 tools · 30.0% escalated (`18/60`) |
+
+> *Generation costs are estimated from recorded `rag_tokens` (`gpt-6-luna`: `$0.10 / 1M` input, `$0.50 / 1M` output). Judge cost (`gpt-5.4-mini`) was `~$0.10–$0.14` per 60-query run. Full per-category breakdown and earlier `gpt-6-luna` judge runs are in [decisions.md](decisions.md).*
 
 ### Key Engineering Findings
-1. **Latency vs. Accuracy Trade-off:**
-   * **CRAG** delivers the lowest latency (**6.94 s**) for straightforward document queries.
-   * **Adaptive Escalate** adds only **+0.29 s** on average (**7.23 s**) while recovering failed retrievals via fallback agent routing, lifting Faithfulness from **4.72 $\rightarrow$ 4.81**.
-   * **Pure ReAct Agent** achieves the highest Faithfulness (**4.90**) and Relevance (**4.98**) through iterative multi-hop tool calls, at the cost of higher tail latency (P95: **35.21 s**).
-2. **Non-Reasoning Determinism (`reasoning_effort="none"`):**
-   * Unconstrained reasoning models frequently extrapolate beyond retrieved passages (over-inference) and reject `temperature=0.0` or standard chat-completion tool calls. Disabling internal reasoning tokens (`reasoning_effort="none"`) restores strict `temp=0.0` determinism, tool-calling compatibility, and keeps inference at the `$0.10 / $0.50` cost tier.
+1. **Latency vs. Completeness Trade-off:**
+   * **CRAG** is the fastest and cheapest mode (**9.42 s** avg, **14.18 s** P95). It gets **5.00** on `direct`, `factual`, and `multi_turn_followup`, but struggles on `comparative` questions (**4.14** Faithfulness, **4.29** Relevance) when one search misses part of the comparison.
+   * **Pure ReAct Agent** handles `comparative` (**4.71 / 5.00**) and `reasoning` (**4.67 / 5.00**) well through multi-step tool calls, but has higher tail latency (**35.29 s** P95) and weaker `out_of_scope` restraint (**4.30** Faithfulness).
+   * **Adaptive Escalate** checks both chunk relevance and overall context sufficiency (`SufficiencyEvaluator`). It handles 70% of queries on the fast CRAG path (keeping **5.00** Multi-Turn and **4.70** Out-of-Scope) and escalates on incomplete/comparative queries (**85.7%** on `comparative`). This gives the top overall **Relevance (4.98)** and **Faithfulness (4.82)** with lower P95 latency than Pure Agent (**27.53 s** vs **35.29 s**). Trade-off: when 30% of queries escalate, running CRAG + Agent back-to-back makes average latency (**12.94 s**) and tokens (**4,432**/query) higher than Pure Agent.
+2. **Non-Reasoning Settings (`reasoning_effort="none"`):**
+   * Reasoning models often add extra outside knowledge beyond the retrieved text, which lowers faithfulness scores, and reject `temperature=0.0`. Setting `reasoning_effort="none"` keeps outputs grounded at `temp=0.0`, works cleanly with tool calling, and stays on the `$0.10 / $0.50` pricing tier.
 
 > *For full architectural trade-offs, ablation studies, and historical benchmarks (V1–V5), see [decisions.md](decisions.md) and [`eval/benchmarks/`](eval/benchmarks/).*
 
@@ -209,3 +211,10 @@ python -m eval.generation.gen_evaluation --mode crag
 python -m eval.generation.gen_evaluation --mode agent
 python -m eval.generation.gen_evaluation --mode escalate
 ```
+
+---
+
+## 7. Future Roadmap
+
+* **Read-Only MCP Server (`FastMCP` / `stdio`):** Expose the hybrid retrieval layer (`search_documents`, `list_documents`) as a lightweight local MCP server so clients like Claude Desktop and Cursor can query indexed documents directly.
+  * **Planned Scope:** Kept **read-only** (document ingestion stays in the CLI and Streamlit UI to avoid long tool timeouts and accidental API costs) and designed for **single-user local setups** without per-user permission filtering.

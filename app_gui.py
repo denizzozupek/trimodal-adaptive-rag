@@ -14,6 +14,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from src.config import (
     DEFAULT_LLM,
+    DEFAULT_RECURSION_LIMIT,
     DEFAULT_RERANK_TOP_K,
     LOCAL_CHAT_HISTORY_FILE,
     RETRIEVAL_FETCH_K,
@@ -312,7 +313,7 @@ if prompt := st.chat_input("Ask a question about your documents..."):
 
     config = {
         "configurable": {"thread_id": active_chat_id},
-        "recursion_limit": 10,
+        "recursion_limit": DEFAULT_RECURSION_LIMIT,
     }
     inputs = {
         "messages": [("user", prompt)],

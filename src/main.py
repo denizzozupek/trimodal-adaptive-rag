@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 
-from src.config import DEFAULT_LLM, DEFAULT_RERANK_TOP_K
+from src.config import DEFAULT_LLM, DEFAULT_RECURSION_LIMIT, DEFAULT_RERANK_TOP_K
 from src.graph.crag import graph_pipeline
 from src.agent.pipeline import agent_pipeline
 from src.graph.escalate import escalate_graph_pipeline
@@ -47,7 +47,7 @@ async def ask_question(
     app: Any,
     query: str,
     selected_files: list[str] | None = None,
-    recursion_limit: int = 10,
+    recursion_limit: int = DEFAULT_RECURSION_LIMIT,
     stream: bool = False,
 ) -> str:
     """Asynchronously runs a user query through the compiled pipeline with recursion protection."""

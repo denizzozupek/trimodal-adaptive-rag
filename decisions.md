@@ -72,16 +72,49 @@ While all three modes perform strongly, **CRAG** remains the most cost- and late
 
 ---
 
-## 4. Advanced Architectures (V3, V4, V5) — Current Production (`GPT-6-luna`)
+## 4. Advanced Architectures (V3, V4, V5) — Early `GPT-6-luna` Same-Model Judge Baseline (`recursion_limit=10`)
 
-- **Model Configuration:** `gpt-6-luna` (`temperature=0.0`, `reasoning_effort="none"`).
-- **Pricing Tier:** Ultra-low cost ($0.10 / 1M Input, $0.50 / 1M Output).
+- **Model Setup:** `gpt-6-luna` (`temperature=0.0`, `reasoning_effort="none"`) used for **both generation and judging**.
+- **Pricing Tier:** $0.10 / 1M Input, $0.50 / 1M Output.
+- **Limitations Found Later:** These first runs used `recursion_limit=10` (causing `1/60` crash in Agent `tc_049` and Escalate `tc_056`), binary relevance grading only (no sufficiency check), and the same model as judge (`5/5` score saturation). Below, "Valid" averages exclude the crashed query (`59/60`); "All 60" counts the crash as `0`.
 
-| Architecture / Mode                 | Configuration              | Faithfulness (0-5) | Relevance (0-5) | Multi-turn Score | Avg Gen Latency | P95 Gen Latency | Avg Tokens / Query | Avg Cost / Query | Total Cost (60 Queries) |
-| ----------------------------------- | -------------------------- | :----------------: | :-------------: | :--------------: | :-------------: | :-------------: | :----------------: | :--------------: | :---------------------: |
-| **V3 CRAG (Single-Pass)**           | `temp=0.0, reasoning=none` |        4.72        |      4.93       |     **4.95**     |   **6.94 s**    |   **10.53 s**   |       2,369        |   **$0.00027**   |       **$0.0164**       |
-| **V5 Adaptive Escalate**            | `temp=0.0, reasoning=none` | **4.81** *(+0.09)* |      4.95       |     **4.95**     |   **7.23 s**    |     15.50 s     |       2,904        |   **$0.00034**   |       **$0.0205**       |
-| **V4 Pure ReAct Agent**             | `temp=0.0, reasoning=none` |      **4.90**      |    **4.98**     |       4.85       |     9.98 s      |     35.21 s     |       3,472        |   **$0.00046**   |       **$0.0279**       |
-| *(Trial)* **V3 CRAG (Thinking On)** | `temp=1.0, reasoning=open` |        4.87        |      4.97       |       4.85       |     10.52 s     |     16.21 s     |       2,944        |     $0.00033     |         $0.0200         |
+| Architecture / Mode                 | Configuration              | Faithfulness (Valid / All 60) | Relevance (Valid / All 60) | Multi-turn Score | Avg Gen Latency | P95 Gen Latency | Avg Tokens / Query | Avg Cost / Query | Total Cost (60 Queries) |
+| ----------------------------------- | -------------------------- | :---------------------------: | :------------------------: | :--------------: | :-------------: | :-------------: | :----------------: | :--------------: | :---------------------: |
+| **V3 CRAG (Single-Pass)**           | `temp=0.0, reasoning=none` |         4.72 / 4.72           |        4.93 / 4.93         |     **4.95**     |   **6.94 s**    |   **10.53 s**   |       2,369        |   **$0.00027**   |       **$0.0164**       |
+| **V5 Adaptive Escalate**            | `temp=0.0, reasoning=none` |         4.81 / 4.73           |        4.95 / 4.87         |     **4.95**     |   **7.23 s**    |     15.50 s     |       2,904        |   **$0.00034**   |       **$0.0205**       |
+| **V4 Pure ReAct Agent**             | `temp=0.0, reasoning=none` |       **4.90 / 4.82**         |      **4.98 / 4.90**       |       4.85       |     9.98 s      |     35.21 s     |       3,472        |   **$0.00046**   |       **$0.0279**       |
+| *(Trial)* **V3 CRAG (Thinking On)** | `temp=1.0, reasoning=open` |         4.87 / 4.87           |        4.97 / 4.97         |       4.85       |     10.52 s     |     16.21 s     |       2,944        |     $0.00033     |         $0.0200         |
 
 **Model Decisions:** All evaluations in this project focused on OpenAI models. Empirically, **non-reasoning configurations (`reasoning_effort="none"`, `temperature=0.0`) consistently outperformed unconstrained reasoning models** in strict RAG settings. Reasoning-enabled models (such as `gpt-5-mini`, `gpt-5-nano`, or `gpt-6-luna` at its default `temperature=1.0`) tend to suffer from **"over-inference" (being overly clever)**—extrapolating beyond the retrieved text by injecting outside domain knowledge (e.g., adding `"(unless P=NP)"` when the source text only states `"NP-complete"`). Under strict LLM-as-a-Judge faithfulness rubrics, any unsupported extrapolation is penalized as a hallucination. By disabling internal reasoning (`reasoning_effort="none"`) on **`gpt-6-luna`**, we unlocked strict `temperature=0.0` determinism, full tool-calling compatibility, zero extrapolation, and an ultra-low pricing tier (**$0.10 / $0.50 per 1M tokens**).
+
+---
+
+## 5. Updated Benchmark: Independent Judge (`gpt-5.4-mini`) & Sufficiency-Aware Escalation
+
+After reviewing the Section 4 results, four fixes were made and all three modes were re-tested on all 60 queries:
+1. **Separate Judge Model (`gpt-5.4-mini`, `temperature=0.0`):** Replaced same-model judging (`gpt-6-luna`) to remove self-bias. The new judge caught minor extra claims in Agent answers (`48/60` 5s vs `53/60` before) and incomplete comparative answers in CRAG (`4.29` Relevance).
+2. **Higher Recursion Limit (`recursion_limit=20`):** Fixed `GraphRecursionError` crashes (`1/60` → **0/60 errors** in all modes).
+3. **Sufficiency Check in Escalate (`SufficiencyEvaluator` + Context Passing):** Binary relevance grading only escalated when *zero* chunks matched, so multi-hop queries with partial chunks stayed on CRAG (`0/6` `reasoning` escalations before). Adding a sufficiency check and passing CRAG's already-found chunks to `fallback_agent` raised `comparative` escalation to **85.7% (`6/7`)** and cut Escalate P95 latency (`33.12 s` → **`27.53 s`**).
+4. **Better Logging:** Added `tool_call_count`, `tools_used`, `escalation_rate`, `error_rate`, and per-category metrics.
+
+### Overall Summary (60/60 Valid, 0% Errors)
+
+| Architecture / Mode | Faithfulness | Relevance | Multi-Turn (F / R) | Avg Gen Latency | P95 Gen Latency | Total RAG Tokens (Avg) | Est. RAG Cost | Est. Judge Cost | Avg Tool Calls | Escalation / Web Rate |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **CRAG (Single-Pass)** | **4.82** | 4.83 | **5.00 / 5.00** | **9.42 s** | **14.18 s** | 142,025 (**2,367**) | ~$0.0172 | ~$0.1022 | 0.00 | 21.7% web (`13/60`) |
+| **Pure ReAct Agent** | 4.72 | 4.97 | 4.85 / 5.00 | 10.65 s | 35.29 s | 217,676 (3,628) | ~$0.0260 | ~$0.1377 | **1.38** (`82` docs, `1` web) | N/A |
+| **Adaptive Escalate** | **4.82** | **4.98** | **5.00 / 5.00** | 12.94 s | 27.53 s | 265,910 (4,432) | ~$0.0305 | ~$0.1261 | 0.73 (`43` docs, `1` web) | 30.0% escalated (`18/60`) |
+
+### Breakdown by Question Type
+
+| Question Type (`n`) | CRAG (F / R · Avg / P95) | Pure ReAct Agent (F / R · Avg / P95 · Tools) | Adaptive Escalate (F / R · Avg / P95 · Esc% · Tools) |
+| :--- | :---: | :---: | :---: |
+| **`comparative`** (7) | 4.14 / 4.29 · 8.46s (10.62s) | **4.71 / 5.00** · 19.43s (35.29s) · `2.29` | 4.57 / **5.00** · 23.06s (29.42s) · 85.7% · `2.86` |
+| **`reasoning`** (6) | **4.67** / 4.67 · 10.49s (16.67s) | **4.67 / 5.00** · 20.89s (36.47s) · `2.17` | 4.33 / **5.00** · 16.28s (36.84s) · 16.7% · `1.00` |
+| **`out_of_scope`** (10) | **4.70 / 4.90** · 10.40s (13.17s) | 4.30 / 4.80 · 12.24s (37.87s) · `1.70` | **4.70 / 4.90** · 17.55s (27.34s) · 90.0% · `1.60` |
+| **`multi_turn_followup`** (20) | **5.00 / 5.00** · 7.77s (11.32s) | 4.85 / **5.00** · 5.69s (7.28s) · `1.00` | **5.00 / 5.00** · 8.27s (12.39s) · 5.0% · `0.05` |
+| **`factual`** (8) | **5.00** / 4.75 · 10.41s (18.31s) | 4.88 / **5.00** · 7.57s (11.35s) · `1.00` | **5.00 / 5.00** · 9.72s (14.81s) · 0.0% · `0.00` |
+| **`direct`** (8) | **5.00 / 5.00** · 10.93s (13.99s) | 4.88 / **5.00** · 9.09s (14.12s) · `1.00` | 4.88 / **5.00** · 10.48s (16.27s) · 12.5% · `0.12` |
+| **`definition`** (1) | **5.00 / 5.00** · 13.02s | 4.00 / **5.00** · 8.30s · `1.00` | **5.00 / 5.00** · 14.86s · 0.0% · `0.00` |
+
+**Main Takeaway:** Running CRAG first and escalating later is only faster/cheaper than a standalone agent when escalation stays low (~10–15%). Once 30% (`18/60`) of queries escalate, those queries pay for both CRAG and the agent loop—making average latency (**12.94 s**) and tokens (**4,432**/query) higher than Pure Agent (**10.65 s**, **3,628**/query). A pre-retrieval query router would avoid that double work on complex queries.

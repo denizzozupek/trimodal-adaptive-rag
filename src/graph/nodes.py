@@ -17,9 +17,11 @@ from src.config import (
 from src.config import DEFAULT_LLM
 from src.prompt import (
     RetrievalEvaluator,
+    SufficiencyEvaluator,
     memory_search_system_prompt,
     system_prompt,
     corrective_rag_prompt,
+    sufficiency_prompt,
     rewrite_for_web_search_prompt,
 )
 from src.graph.state import State
@@ -146,11 +148,17 @@ def create_generation_node(
 # 4. Grade Documents Node
 def create_grade_documents_node(
     llm: BaseChatModel = DEFAULT_LLM,
+    check_sufficiency: bool = False,
 ) -> Callable[[State], Any]:
-    """Creates a node that evaluates the relevancy of retrieved documents to the user's question."""
+    """Creates a node that evaluates the relevancy (and optionally combined sufficiency) of retrieved documents."""
 
     evaluator_chain = corrective_rag_prompt | llm.with_structured_output(
         RetrievalEvaluator
+    )
+    sufficiency_chain = (
+        sufficiency_prompt | llm.with_structured_output(SufficiencyEvaluator)
+        if check_sufficiency
+        else None
     )
 
     async def grade_documents_node(state: State) -> dict:
@@ -184,8 +192,26 @@ def create_grade_documents_node(
 
         web_search_needed = len(filtered_docs) == 0
         if web_search_needed:
-            logger.info("No relevant documents found after grading. Web search needed.")
-        else:
+            logger.info("No relevant documents found after grading. Fallback needed.")
+        elif sufficiency_chain is not None:
+            combined_context = format_docs_as_context(filtered_docs)
+            try:
+                with get_openai_callback() as suff_cb:
+                    suff_result = await sufficiency_chain.ainvoke(
+                        {"context": combined_context, "query": query}
+                    )
+                    grader_tokens += suff_cb.total_tokens
+                    grader_cost_usd = round(grader_cost_usd + suff_cb.total_cost, 6)
+                if not getattr(suff_result, "is_sufficient", True):
+                    logger.info(
+                        "Retained %d relevant doc(s), but context is insufficient. Escalating to agent.",
+                        len(filtered_docs),
+                    )
+                    web_search_needed = True
+            except Exception as e:
+                logger.warning("Sufficiency check failed, proceeding with filtered docs: %s", e)
+
+        if not web_search_needed:
             logger.info(
                 "Grading complete: %d of %d documents retained.",
                 len(filtered_docs),

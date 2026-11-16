@@ -11,16 +11,25 @@ from langchain_community.callbacks import get_openai_callback
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
+from collections import Counter
+
 from eval.generation.prompts import build_judge_prompt
 from eval.generation.schemas import (
     GenerationEvaluationItem,
     GenerationEvaluationReport,
     GenerationSummary,
     JudgeEvaluationPrompt,
+    QuestionTypeMetrics,
     RunMetadata,
 )
 
-from src.config import DEFAULT_LLM, CONCURRENT_SEMAPHORE, DEFAULT_RERANK_TOP_K
+from src.config import (
+    CONCURRENT_SEMAPHORE,
+    DEFAULT_LLM,
+    DEFAULT_RECURSION_LIMIT,
+    DEFAULT_RERANK_TOP_K,
+    JUDGE_LLM,
+)
 from src.ingestion import ingestion_pipeline
 from src.utils import calculate_percentile, format_docs_as_context, format_history
 from src.retrieval.reranker import get_cross_encoder_model
@@ -40,6 +49,12 @@ def parse_arguments():
         description="Evaluate queries using a graph pipeline and judge LLM."
     )
     parser.add_argument("--mode", choices=["crag", "agent", "escalate"], default="crag")
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=JUDGE_LLM.model_name,
+        help="Model name to use as the independent LLM judge.",
+    )
     return parser.parse_args()
 
 
@@ -67,18 +82,34 @@ async def evaluate_query_with_semaphore(app, judge_llm, item, top_k, crag_enable
             # 1. RAG Pipeline Execution (Rewrite, Retrieval, Grading if CRAG, Generation)
             with get_openai_callback() as rag_cb:
                 gen_start = perf_counter()
-                output = await app.ainvoke(state_input, config={"recursion_limit": 10})
+                output = await app.ainvoke(
+                    state_input, config={"recursion_limit": DEFAULT_RECURSION_LIMIT}
+                )
                 generation_time_ms = round((perf_counter() - gen_start) * 1000, 2)
 
             retrieved_docs = output.get("documents", [])
+            messages = output.get("messages", [])
 
+            context_parts = []
             if retrieved_docs:
-                context = format_docs_as_context(retrieved_docs)
-            else:
-                tool_contents = [str(msg.content) for msg in output.get("messages", []) if msg.type == "tool"]
-                context = "\n\n".join(tool_contents)
+                context_parts.append(format_docs_as_context(retrieved_docs))
+            tool_contents = [
+                str(msg.content) for msg in messages if msg.type == "tool"
+            ]
+            if tool_contents:
+                context_parts.append("\n\n".join(tool_contents))
+            context = "\n\n".join(context_parts)
 
-            answer = output["messages"][-1].content
+            tools_counter: Counter[str] = Counter()
+            for msg in messages:
+                if getattr(msg, "tool_calls", None):
+                    for tc in msg.tool_calls:
+                        tool_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "unknown")
+                        tools_counter[str(tool_name)] += 1
+            tools_used = dict(tools_counter)
+            tool_call_count = sum(tools_used.values())
+
+            answer = messages[-1].content
 
             # 2. LLM Judge Execution (Independent Evaluation)
             prompt = build_judge_prompt(
@@ -100,6 +131,8 @@ async def evaluate_query_with_semaphore(app, judge_llm, item, top_k, crag_enable
             total_tokens = rag_tokens + judge_tokens
             cost_usd = round(rag_cost + judge_cost, 6)
 
+            escalated = bool(output.get("web_search_needed", False)) if crag_enable else None
+
             result = {
                 "id": item.get("id"),
                 "query": query_text,
@@ -108,6 +141,7 @@ async def evaluate_query_with_semaphore(app, judge_llm, item, top_k, crag_enable
                 "top_k": top_k,
                 "context": context,
                 "answer": answer,
+                "error": None,
                 "generation_latency_ms": generation_time_ms,
                 "judge_latency_ms": judge_time_ms,
                 "total_latency_ms": total_time_ms,
@@ -117,14 +151,17 @@ async def evaluate_query_with_semaphore(app, judge_llm, item, top_k, crag_enable
                 "judge_cost_usd": judge_cost,
                 "total_tokens": total_tokens,
                 "cost_usd": cost_usd,
+                "tool_call_count": tool_call_count,
+                "tools_used": tools_used,
+                "escalated": escalated,
                 "judge_result": judge_result.model_dump(),
             }
 
             if crag_enable:
-                is_web = output.get("web_search_needed", False)
+                is_web = bool(escalated)
                 result["crag_telemetry"] = {
                     "web_search_triggered": is_web,
-                    "docs_after_grading": 0 if is_web else len(retrieved_docs),
+                    "docs_after_grading": len(retrieved_docs),
                     "grader_tokens": output.get("grader_tokens", 0) or 0,
                     "grader_cost_usd": output.get("grader_cost_usd", 0.0) or 0.0,
                 }
@@ -142,6 +179,7 @@ async def evaluate_query_with_semaphore(app, judge_llm, item, top_k, crag_enable
                 "top_k": top_k,
                 "context": None,
                 "answer": None,
+                "error": str(e),
                 "generation_latency_ms": 0.0,
                 "judge_latency_ms": 0.0,
                 "total_latency_ms": total_time_ms,
@@ -151,6 +189,9 @@ async def evaluate_query_with_semaphore(app, judge_llm, item, top_k, crag_enable
                 "judge_cost_usd": 0.0,
                 "total_tokens": 0,
                 "cost_usd": 0.0,
+                "tool_call_count": 0,
+                "tools_used": {},
+                "escalated": None,
                 "judge_result": {
                     "faithfulness_reason": str(e),
                     "faithfulness_score": 0,
@@ -195,6 +236,19 @@ def save_judge_results(
 
     total_questions = len(results)
     total_valid = len(valid_results)
+    error_count = total_questions - total_valid
+    error_rate = round((error_count / total_questions) * 100, 2) if total_questions > 0 else 0.0
+
+    all_avg_faithfulness = (
+        sum(r["judge_result"]["faithfulness_score"] for r in results) / total_questions
+        if total_questions > 0
+        else 0.0
+    )
+    all_avg_relevance = (
+        sum(r["judge_result"]["relevance_score"] for r in results) / total_questions
+        if total_questions > 0
+        else 0.0
+    )
 
     if total_valid > 0:
         avg_faithfulness = (
@@ -223,6 +277,9 @@ def save_judge_results(
             sum(r.get("rag_tokens", 0) for r in valid_results) / total_valid
         )
         avg_tokens = sum(r.get("total_tokens", 0) for r in valid_results) / total_valid
+        avg_tool_calls = (
+            sum(r.get("tool_call_count", 0) for r in valid_results) / total_valid
+        )
 
         total_grader_cost = sum(
             r.get("crag_telemetry", {}).get("grader_cost_usd", 0.0)
@@ -241,10 +298,10 @@ def save_judge_results(
         )
 
         logger.info(
-            f"Average Faithfulness Score: {avg_faithfulness:.2f} ({total_valid}/{total_questions} valid)"
+            f"Valid Average Faithfulness: {avg_faithfulness:.2f} | All-Query Avg: {all_avg_faithfulness:.2f} ({total_valid}/{total_questions} valid, error_rate={error_rate:.2f}%)"
         )
         logger.info(
-            f"Average Relevance Score: {avg_relevance:.2f} ({total_valid}/{total_questions} valid)"
+            f"Valid Average Relevance:    {avg_relevance:.2f} | All-Query Avg: {all_avg_relevance:.2f}"
         )
         logger.info(
             f"Average Generation Latency: {avg_gen_ms:.2f} ms | P95: {p95_gen_ms:.2f} ms"
@@ -253,7 +310,7 @@ def save_judge_results(
             f"Average Total Latency: {avg_total_ms:.2f} ms | P95: {p95_total_ms:.2f} ms"
         )
         logger.info(
-            f"Production RAG Cost: ${total_rag_cost:.4f} USD | Avg RAG Tokens/Query: {avg_rag_tokens:.1f}"
+            f"Production RAG Cost: ${total_rag_cost:.4f} USD | Avg RAG Tokens/Query: {avg_rag_tokens:.1f} | Avg Tool Calls/Query: {avg_tool_calls:.2f}"
         )
         if metadata.crag_enabled:
             logger.info(
@@ -277,6 +334,52 @@ def save_judge_results(
         total_judge_cost = 0.0
         total_cost = 0.0
         avg_tokens = 0.0
+        avg_tool_calls = 0.0
+
+    escalation_count = None
+    escalation_rate = None
+    if metadata.crag_enabled and total_valid > 0:
+        escalation_count = sum(1 for r in valid_results if r.get("escalated") is True)
+        escalation_rate = round((escalation_count / total_valid) * 100, 2)
+        logger.info(
+            f"Fallback / Escalation Rate: {escalation_count}/{total_valid} ({escalation_rate:.2f}%)"
+        )
+
+    by_question_type: dict[str, QuestionTypeMetrics] = {}
+    qtypes = sorted({r.get("question_type") or "unknown" for r in results})
+    for qt in qtypes:
+        qt_rows = [r for r in results if (r.get("question_type") or "unknown") == qt]
+        qt_valid = [r for r in qt_rows if r["context"] is not None and r["answer"] is not None]
+        qt_count = len(qt_rows)
+        qt_valid_count = len(qt_valid)
+        qt_err_count = qt_count - qt_valid_count
+        qt_esc_count = (
+            sum(1 for r in qt_valid if r.get("escalated") is True)
+            if metadata.crag_enabled and qt_valid_count > 0
+            else (0 if metadata.crag_enabled else None)
+        )
+        qt_esc_rate = (
+            round((qt_esc_count / qt_valid_count) * 100, 2)
+            if metadata.crag_enabled and qt_valid_count > 0 and qt_esc_count is not None
+            else (0.0 if metadata.crag_enabled else None)
+        )
+        by_question_type[qt] = QuestionTypeMetrics(
+            count=qt_count,
+            valid_count=qt_valid_count,
+            error_count=qt_err_count,
+            avg_faithfulness_all=round(sum(r["judge_result"]["faithfulness_score"] for r in qt_rows) / qt_count, 2),
+            avg_faithfulness_valid=round(sum(r["judge_result"]["faithfulness_score"] for r in qt_valid) / qt_valid_count, 2) if qt_valid_count else 0.0,
+            avg_relevance_all=round(sum(r["judge_result"]["relevance_score"] for r in qt_rows) / qt_count, 2),
+            avg_relevance_valid=round(sum(r["judge_result"]["relevance_score"] for r in qt_valid) / qt_valid_count, 2) if qt_valid_count else 0.0,
+            avg_generation_latency_ms=round(sum(r["generation_latency_ms"] for r in qt_valid) / qt_valid_count, 2) if qt_valid_count else 0.0,
+            p95_generation_latency_ms=round(calculate_percentile([r["generation_latency_ms"] for r in qt_valid], 0.95), 2) if qt_valid_count else 0.0,
+            avg_tool_calls=round(sum(r.get("tool_call_count", 0) for r in qt_valid) / qt_valid_count, 2) if qt_valid_count else 0.0,
+            escalation_count=qt_esc_count,
+            escalation_rate=qt_esc_rate,
+        )
+        logger.info(
+            f"  [{qt}] n={qt_count} valid={qt_valid_count} | ALL F={by_question_type[qt].avg_faithfulness_all:.2f} R={by_question_type[qt].avg_relevance_all:.2f} | VALID F={by_question_type[qt].avg_faithfulness_valid:.2f} R={by_question_type[qt].avg_relevance_valid:.2f} | AvgLat={by_question_type[qt].avg_generation_latency_ms:.0f}ms | Tools={by_question_type[qt].avg_tool_calls:.2f}"
+        )
 
     multiturn_questions = [
         r for r in valid_results if r["question_type"] == "multi_turn_followup"
@@ -306,6 +409,8 @@ def save_judge_results(
     summary = GenerationSummary(
         avg_faithfulness=round(avg_faithfulness, 2),
         avg_relevance=round(avg_relevance, 2),
+        all_questions_avg_faithfulness=round(all_avg_faithfulness, 2),
+        all_questions_avg_relevance=round(all_avg_relevance, 2),
         avg_multiturn_faithfulness=(
             round(avg_multiturn_faithfulness, 2)
             if avg_multiturn_faithfulness is not None
@@ -316,6 +421,8 @@ def save_judge_results(
             if avg_multiturn_relevance is not None
             else None
         ),
+        error_count=error_count,
+        error_rate=error_rate,
         avg_generation_latency_ms=round(avg_gen_ms, 2),
         avg_judge_latency_ms=round(avg_judge_ms, 2),
         avg_total_latency_ms=round(avg_total_ms, 2),
@@ -328,6 +435,10 @@ def save_judge_results(
         total_judge_cost_usd=round(total_judge_cost, 4),
         total_run_cost_usd=round(total_cost, 4),
         avg_tokens_per_query=round(avg_tokens, 1),
+        avg_tool_calls_per_query=round(avg_tool_calls, 2),
+        escalation_count=escalation_count,
+        escalation_rate=escalation_rate,
+        by_question_type=by_question_type,
     )
 
     report = GenerationEvaluationReport(
@@ -339,7 +450,7 @@ def save_judge_results(
         detailed_results=[GenerationEvaluationItem(**r) for r in results],
     )
 
-    output_path = f"eval/results/generation/judge_results_{run_id}.json"
+    output_path = f"eval/results/generation/judge_results_{metadata.mode}_{run_id}.json"
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -350,6 +461,8 @@ def save_judge_results(
 
 
 if __name__ == "__main__":
+    args = parse_arguments()
+
     ingestion_pipeline(pdf_path="data/arxiv1.pdf")
     ingestion_pipeline(pdf_path="data/arxiv2.pdf")
     ingestion_pipeline(pdf_path="data/arxiv3.pdf")
@@ -357,9 +470,11 @@ if __name__ == "__main__":
     with open("data/ground_truth.json", "r", encoding="utf-8") as f:
         ground_truth = json.load(f)
 
-    args = parse_arguments()
-
-    base_judge_llm = DEFAULT_LLM
+    base_judge_llm = (
+        JUDGE_LLM
+        if args.judge_model == JUDGE_LLM.model_name
+        else ChatOpenAI(model=args.judge_model, temperature=0, timeout=30, max_retries=3)
+    )
     judge_llm = base_judge_llm.with_structured_output(JudgeEvaluationPrompt)
 
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

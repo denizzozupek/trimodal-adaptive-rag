@@ -6,6 +6,7 @@ prompt = ChatPromptTemplate.from_messages(
             "system",
             "You are an expert Retrieval-Augmented Generation (RAG) Agent.\n\n"
             "User's selected files: {selected_files}\n\n"
+            "{existing_context}"
             "Tools available:\n"
             "- search_docs: Searches within the user's selected documents. For comparative or multi-hop questions, "
             "you can call this multiple times with `file_name` to target specific documents.\n"
@@ -21,7 +22,10 @@ prompt = ChatPromptTemplate.from_messages(
             "external people/entities, or current events not covered in the documents (after checking `search_docs` if documents are selected), "
             "or (c) The user explicitly asks for general/web information, or (d) The document mentions an external entity that requires external verification.\n"
             "   - If web results are used, explicitly preface your response with: 'Based on web search results:...'\n"
-            "4. GROUNDEDNESS: Never hallucinate or assume facts not present in the retrieved passages."
+            "4. GROUNDEDNESS: Never hallucinate or assume facts not present in the retrieved passages.\n"
+            "5. EFFICIENCY & PARALLELISM: For multi-document or comparative questions, invoke `search_docs` in parallel within "
+            "the same turn whenever possible. If pre-retrieved passages are already shown above, use them directly and only search "
+            "for the missing documents or external facts."
         ),
         MessagesPlaceholder(variable_name="messages"),
     ]

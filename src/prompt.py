@@ -10,6 +10,18 @@ class RetrievalEvaluator(BaseModel):
     )
 
 
+class SufficiencyEvaluator(BaseModel):
+    """Determine whether the combined retrieved passages are sufficient to fully answer the question."""
+
+    is_sufficient: bool = Field(
+        description=(
+            "True ONLY if the combined passages contain all facts needed to completely answer every part "
+            "of the user's question (including multi-hop or comparative parts). False if key information "
+            "is missing or only one side of a comparison is covered."
+        )
+    )
+
+
 memory_search_system_prompt = """Given a chat history and the latest user question \
 which might reference context in the chat history, formulate a standalone question \
 which can be understood without the chat history. Do NOT answer the question, \
@@ -29,6 +41,24 @@ corrective_rag_prompt = ChatPromptTemplate.from_messages(
             ""
         ),
         ("human", "Retrieved Document: {source_doc}\n\nUser's Question: {query}")
+    ]
+)
+
+
+sufficiency_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a calibrated context sufficiency evaluator for a RAG system.\n"
+            "Given the user's question and the retained document passages combined, decide whether there is enough information "
+            "to give a solid, grounded answer.\n"
+            "- Return is_sufficient=True for direct, factual, definition, or follow-up questions if the main facts to answer "
+            "the question are present—even if minor extra background is absent.\n"
+            "- Return is_sufficient=False ONLY when a core part of the question is clearly missing from the passages "
+            "(for example: a comparative question covering only one of the compared items, a multi-hop step whose bridge "
+            "entity/paper is absent, or an out-of-scope topic not addressed in the passages).",
+        ),
+        ("human", "Retained Context:\n{context}\n\nUser's Question: {query}"),
     ]
 )
 

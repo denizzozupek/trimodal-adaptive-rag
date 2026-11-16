@@ -53,7 +53,10 @@ def escalate_graph_pipeline(
         tool_node = ToolNode([search_docs, search_web])
         workflow.add_node("tools", tool_node)
 
-        workflow.add_node("grade_documents", create_grade_documents_node(llm=llm))
+        workflow.add_node(
+            "grade_documents",
+            create_grade_documents_node(llm=llm, check_sufficiency=True),
+        )
         workflow.add_node("fallback_agent", fallback_agent_node(llm=llm))
 
         workflow.add_edge("retrieve_and_rerank", "grade_documents")
